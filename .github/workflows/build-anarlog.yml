@@ -1,0 +1,95 @@
+name: Build Anarlog (local Whisper 1 GB)
+
+# Builds Anarlog for Apple Silicon Macs from the official open-source code,
+# with one change: the local Whisper (BYO-model) upload limit is raised from
+# 100 MB to 1 GB so meetings longer than ~1h49m transcribe on-device.
+# Auto-update is turned off so the official update can't replace this build.
+
+on:
+  workflow_dispatch:
+    inputs:
+      anarlog_ref:
+        description: "Anarlog branch, tag or commit to build"
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 240
+    env:
+      TARGET: aarch64-apple-darwin
+      CONF: ./src-tauri/tauri.conf.stable.json
+      APP_VERSION: "1.4.99"
+    steps:
+      - name: Get Anarlog source
+        uses: actions/checkout@v4
+        with:
+          repository: fastrepl/anarlog
+          ref: ${{ inputs.anarlog_ref }}
+          lfs: true
+          submodules: recursive
+
+      - name: Raise local Whisper limit to 1 GB
+        run: |
+          FILE=crates/transcribe-whisper-local/src/service/batch.rs
+          sed -i '' 's/^const MAX_BATCH_AUDIO_BODY_BYTES: usize = 100 \* 1024 \* 1024;/const MAX_BATCH_AUDIO_BODY_BYTES: usize = 1024 * 1024 * 1024;/' "$FILE"
+          grep -n 'MAX_BATCH_AUDIO_BODY_BYTES: usize = 1024 \* 1024 \* 1024' "$FILE"
+
+      - name: Local build settings (no updater, ad-hoc signing)
+        run: |
+          ./scripts/version.sh "./apps/desktop/src-tauri/tauri.conf.json" "$APP_VERSION"
+          cat > apps/desktop/src-tauri/tauri.conf.local.json <<'JSON'
+          {
+            "bundle": {
+              "createUpdaterArtifacts": false,
+              "targets": ["app"],
+              "macOS": { "signingIdentity": "-" }
+            },
+            "plugins": { "updater": { "active": false } }
+          }
+          JSON
+
+      - uses: ./.github/actions/install_desktop_deps
+        with:
+          target: macos
+      - uses: ./.github/actions/rust_install
+        with:
+          platform: macos
+      - run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> $GITHUB_ENV
+      - uses: ./.github/actions/pnpm_install
+      - run: pnpm -F ui build
+
+      - name: Prepare helper binaries
+        run: |
+          TAURI_ENV_TARGET_TRIPLE=$TARGET cargo xtask prepare-binaries
+          ./scripts/sidecar.sh "./apps/desktop/$CONF" "binaries/char-chrome-native-host"
+          ./scripts/sidecar.sh "./apps/desktop/$CONF" "binaries/check-permissions"
+          ./scripts/sidecar.sh "./apps/desktop/$CONF" "resources/cli/anarlog-cli"
+          codesign --force --sign - crates/cloudsync/vendor/cloudsync/macos/aarch64/cloudsync.dylib
+
+      - name: Build Anarlog
+        env:
+          CI: false
+          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+          POSTHOG_API_KEY: phc_local_build_disabled
+          VITE_APP_URL: "https://anarlog.so"
+          VITE_API_URL: "https://api.anarlog.so"
+          VITE_APP_VERSION: ${{ env.APP_VERSION }}
+        run: |
+          pnpm -F desktop tauri build --target $TARGET \
+            --config $CONF --config ./src-tauri/tauri.conf.local.json --verbose
+
+      - name: Package app
+        run: |
+          APP=$(ls -d target/$TARGET/release/bundle/macos/*.app apps/desktop/src-tauri/target/$TARGET/release/bundle/macos/*.app 2>/dev/null | head -1)
+          echo "Built: $APP"
+          ditto -c -k --keepParent "$APP" Anarlog-local-whisper.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Anarlog-local-whisper
+          path: Anarlog-local-whisper.zip
+          retention-days: 30
